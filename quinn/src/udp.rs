@@ -4,14 +4,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::ready;
-use mio;
-
-use tokio::io::PollEvented;
-
+use async_std::sync::{Receiver, Sender};
+use async_std::task;
 use proto::{EcnCodepoint, Transmit};
-
-use crate::platform::UdpExt;
+use std::sync::{Arc, Mutex};
 
 /// Tokio-compatible UDP socket with some useful specializations.
 ///
@@ -19,51 +15,56 @@ use crate::platform::UdpExt;
 /// platforms.
 #[derive(Debug)]
 pub struct UdpSocket {
-    io: PollEvented<mio::net::UdpSocket>,
+    socket: (
+        Sender<Transmit>,
+        Receiver<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
+    ),
+    recv_result: Arc<Mutex<Option<io::Result<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>>>>,
 }
 
 impl UdpSocket {
-    pub fn from_std(socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
-        let io = mio::net::UdpSocket::from_socket(socket)?;
-        io.init_ext()?;
-        let io = PollEvented::new(io)?;
-        Ok(UdpSocket { io })
+    pub fn from_std(
+        socket: (
+            Sender<Transmit>,
+            Receiver<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
+        ),
+    ) -> UdpSocket {
+        UdpSocket {
+            socket,
+            recv_result: Arc::new(Mutex::new(None)),
+        }
     }
 
-    pub fn poll_send(
-        &self,
-        cx: &mut Context,
-        transmits: &[Transmit],
-    ) -> Poll<Result<usize, io::Error>> {
-        ready!(self.io.poll_write_ready(cx))?;
-        match self.io.get_ref().send_ext(transmits) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.clear_write_ready(cx)?;
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(e)),
-        }
+    pub fn send(&self, transmit: Transmit) {
+        let sender = self.socket.0.clone();
+        task::spawn(async move {
+            sender.send(transmit).await;
+        });
     }
 
     pub fn poll_recv(
         &self,
         cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, SocketAddr, Option<EcnCodepoint>)>> {
-        ready!(self.io.poll_read_ready(cx, mio::Ready::readable()))?;
-        match self.io.get_ref().recv_ext(buf) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.clear_read_ready(cx, mio::Ready::readable())?;
+    ) -> Poll<io::Result<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>> {
+        match self.recv_result.lock().unwrap().take() {
+            Some(it) => Poll::Ready(it),
+            None => {
+                let receiver = self.socket.1.clone();
+                let recv_result = self.recv_result.clone();
+                let waker = cx.waker().clone();
+                task::spawn(async move {
+                    *recv_result.lock().unwrap() = Some(match receiver.recv().await {
+                        Ok(it) => Ok(it),
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "connection terminated",
+                        )),
+                    });
+                    waker.wake();
+                });
                 Poll::Pending
             }
-            Err(e) => Poll::Ready(Err(e)),
         }
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.io.get_ref().local_addr()
     }
 }
 

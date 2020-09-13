@@ -87,26 +87,6 @@ where
         Ok(endpoint.create_connection(ch, conn))
     }
 
-    /// Switch to a new UDP socket
-    ///
-    /// Allows the endpoint's address to be updated live, affecting all active connections. Incoming
-    /// connections and connections to servers unreachable from the new address will be lost.
-    ///
-    /// On error, the old UDP socket is retained.
-    pub fn rebind(&self, socket: std::net::UdpSocket) -> io::Result<()> {
-        let addr = socket.local_addr()?;
-        let socket = UdpSocket::from_std(socket)?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.socket = socket;
-        inner.ipv6 = addr.is_ipv6();
-        Ok(())
-    }
-
-    /// Get the local `SocketAddr` the underlying socket is bound to
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.lock().unwrap().socket.local_addr()
-    }
-
     /// Close all of this endpoint's connections immediately and cease accepting new connections.
     ///
     /// See `Connection::close` for details.
@@ -242,7 +222,6 @@ where
     /// Set if the endpoint has been manually closed
     close: Option<(VarInt, Bytes)>,
     driver_lost: bool,
-    recv_buf: Box<[u8]>,
     idle: Broadcast,
 }
 
@@ -253,12 +232,9 @@ where
     fn drive_recv(&mut self, cx: &mut Context, now: Instant) -> Result<bool, io::Error> {
         let mut recvd = 0;
         loop {
-            match self.socket.poll_recv(cx, &mut self.recv_buf) {
-                Poll::Ready(Ok((n, addr, ecn))) => {
-                    match self
-                        .inner
-                        .handle(now, addr, ecn, (&self.recv_buf[0..n]).into())
-                    {
+            match self.socket.poll_recv(cx) {
+                Poll::Ready(Ok((received, addr, ecn))) => {
+                    match self.inner.handle(now, addr, ecn, (&received[..]).into()) {
                         Some((handle, DatagramEvent::NewConnection(conn))) => {
                             let conn = self.create_connection(handle, conn);
                             if self.incoming_live {
@@ -299,35 +275,13 @@ where
         Ok(false)
     }
 
-    fn drive_send(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
-        let mut calls = 0;
+    fn drive_send(&mut self, _cx: &mut Context) -> Result<bool, io::Error> {
         loop {
-            while self.outgoing.len() < crate::udp::BATCH_SIZE {
-                match self.inner.poll_transmit() {
-                    Some(x) => self.outgoing.push_back(x),
-                    None => break,
+            match self.inner.poll_transmit() {
+                Some(x) => {
+                    self.socket.send(x);
                 }
-            }
-            if self.outgoing.is_empty() {
-                return Ok(false);
-            }
-            match self.socket.poll_send(cx, self.outgoing.as_slices().0) {
-                Poll::Ready(Ok(n)) => {
-                    self.outgoing.drain(..n);
-                    calls += 1;
-                    if calls == IO_LOOP_BOUND {
-                        return Ok(true);
-                    }
-                }
-                Poll::Pending => {
-                    return Ok(false);
-                }
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    return Ok(false);
-                }
-                Poll::Ready(Err(e)) => {
-                    return Err(e);
-                }
+                None => return Ok(false),
             }
         }
     }
@@ -353,7 +307,7 @@ where
                                 .unbounded_send(ConnectionEvent::Proto(event));
                         }
                     }
-                    Transmit(t) => self.outgoing.push_back(t),
+                    Transmit(t) => self.socket.send(t),
                 },
                 Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
                 Poll::Pending => {
@@ -461,7 +415,6 @@ where
             ref_count: 0,
             close: None,
             driver_lost: false,
-            recv_buf: vec![0; 64 * 1024].into(),
             idle: Broadcast::new(),
         })))
     }

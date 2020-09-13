@@ -133,9 +133,6 @@ mod rustls_impls {
 #[cfg(feature = "rustls")]
 pub use rustls_impls::*;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug)]
 enum ConnectionEvent {
     Close {

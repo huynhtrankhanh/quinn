@@ -11,6 +11,9 @@ use crate::{
 #[cfg(feature = "rustls")]
 use crate::{Certificate, CertificateChain, PrivateKey};
 
+use async_std::sync::{Receiver, Sender};
+use proto::{EcnCodepoint, Transmit};
+
 /// A helper for constructing an `Endpoint`.
 ///
 /// See `ClientConfigBuilder` for details on trust defaults.
@@ -39,25 +42,19 @@ where
         }
     }
 
-    /// Build an endpoint bound to `addr`
-    ///
-    /// Must be called from within a tokio runtime context.
-    pub fn bind(self, addr: &SocketAddr) -> Result<(Endpoint<S>, Incoming<S>), EndpointError> {
-        let socket = std::net::UdpSocket::bind(addr).map_err(EndpointError::Socket)?;
-        self.with_socket(socket)
-    }
-
     /// Build an endpoint around a pre-configured socket.
     pub fn with_socket(
         self,
-        socket: std::net::UdpSocket,
+        socket: (
+            Sender<Transmit>,
+            Receiver<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
+        ),
     ) -> Result<(Endpoint<S>, Incoming<S>), EndpointError> {
-        let addr = socket.local_addr().map_err(EndpointError::Socket)?;
-        let socket = UdpSocket::from_std(socket).map_err(EndpointError::Socket)?;
+        let socket = UdpSocket::from_std(socket);
         let rc = EndpointRef::new(
             socket,
             proto::generic::Endpoint::new(Arc::new(self.config), self.server_config.map(Arc::new)),
-            addr.is_ipv6(),
+            true,
         );
         let driver = EndpointDriver(rc.clone());
         tokio::spawn(async {

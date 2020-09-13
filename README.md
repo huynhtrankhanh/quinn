@@ -1,3 +1,5 @@
+**Note:** This is a patch for the quinn library to emit UDP datagrams to async-std channels.
+
 # Quinn
 
 [![Documentation](https://docs.rs/quinn/badge.svg)](https://docs.rs/quinn/)
