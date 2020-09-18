@@ -60,8 +60,11 @@ mod udp;
 
 pub use proto::{
     crypto, ApplicationClose, Certificate, CertificateChain, ConnectError, ConnectionClose,
-    ConnectionError, ParseError, PrivateKey, Transmit, TransportConfig, VarInt,
+    ConnectionError, EcnCodepoint, ParseError, PrivateKey, Transmit, TransportConfig, VarInt,
 };
+
+use async_std::sync::{Receiver, Sender};
+use async_std::task;
 
 pub use crate::builders::EndpointError;
 pub use crate::connection::{SendDatagramError, ZeroRttAccepted};
@@ -153,3 +156,151 @@ enum EndpointEvent {
 /// This helps ensure we don't starve anything when the CPU is slower than the link. Value selected
 /// more or less arbitrarily.
 const IO_LOOP_BOUND: usize = 10;
+
+use futures::StreamExt;
+use std::{error::Error, net::SocketAddr, sync::Arc};
+
+use crate::{ClientConfig, ClientConfigBuilder, Endpoint};
+
+fn main() {
+    task::block_on(async move {
+        use async_std::io::{self, BufReader};
+        let mut incoming_data = BufReader::new(io::stdin());
+        loop {
+            let mut line = String::new();
+            incoming_data.read_line(&mut line).await.unwrap();
+
+            let blob = base64::decode(line).unwrap();
+
+            let mut counter: usize = 0;
+
+            let mut advance = |count: usize| {
+                let left = counter;
+                counter += count;
+                if counter > blob.len() {
+                    return None;
+                }
+                Some(&blob[left..counter])
+            };
+
+            let version = match advance(1) {
+                Some(it) => it[0],
+                None => continue,
+            };
+
+            if version != 0 {
+                // First byte indicates version. This is the first revision
+                // of the tunneling protocol, so the version byte is expected
+                // to be zero. The incoming packet is discarded.
+                continue;
+            }
+        }
+    });
+}
+
+fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_der = cert.serialize_der().unwrap();
+    let priv_key = cert.serialize_private_key_der();
+    let priv_key = PrivateKey::from_der(&priv_key)?;
+
+    let mut transport_config = TransportConfig::default();
+    transport_config.stream_window_uni(0);
+    let mut server_config = ServerConfig::default();
+    server_config.transport = Arc::new(transport_config);
+    let mut cfg_builder = ServerConfigBuilder::new(server_config);
+    let cert = Certificate::from_der(&cert_der)?;
+    cfg_builder.certificate(CertificateChain::from_certs(vec![cert]), priv_key)?;
+
+    Ok((cfg_builder.build(), cert_der))
+}
+
+fn make_server_endpoint(
+    socket: (
+        Sender<Transmit>,
+        Receiver<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
+    ),
+) -> Result<(Incoming, Vec<u8>), Box<dyn Error>> {
+    let (server_config, server_cert) = configure_server()?;
+    let mut endpoint_builder = Endpoint::builder();
+    endpoint_builder.listen(server_config);
+    let (_endpoint, incoming) = endpoint_builder.with_socket(socket)?;
+    Ok((incoming, server_cert))
+}
+
+/// Runs a QUIC server bound to given address.
+async fn run_server(
+    socket: (
+        Sender<Transmit>,
+        Receiver<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
+    ),
+) {
+    let (mut incoming, _server_cert) = make_server_endpoint(socket).unwrap();
+    // accept a single connection
+    let incoming_conn = incoming.next().await.unwrap();
+    let new_conn = incoming_conn.await.unwrap();
+    println!(
+        "[server] connection accepted: addr={}",
+        new_conn.connection.remote_address()
+    );
+}
+
+async fn run_client(
+    server_addr: SocketAddr,
+    socket: (
+        Sender<Transmit>,
+        Receiver<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
+    ),
+) -> Result<(), Box<dyn Error>> {
+    let client_cfg = configure_client();
+    let mut endpoint_builder = Endpoint::builder();
+    endpoint_builder.default_client_config(client_cfg);
+
+    let (endpoint, _) = endpoint_builder.with_socket(socket).unwrap();
+
+    // connect to server
+    let crate::NewConnection { connection, .. } = endpoint
+        .connect(&server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    println!("[client] connected: addr={}", connection.remote_address());
+    // Dropping handles allows the corresponding objects to automatically shut down
+    drop(connection);
+    // Make sure the server has a chance to clean up
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+/// Dummy certificate verifier that treats any certificate as valid.
+/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _roots: &rustls::RootCertStore,
+        _presented_certs: &[rustls::Certificate],
+        _dns_name: webpki::DNSNameRef,
+        _ocsp_response: &[u8],
+    ) -> Result<rustls::ServerCertVerified, rustls::TLSError> {
+        Ok(rustls::ServerCertVerified::assertion())
+    }
+}
+
+fn configure_client() -> ClientConfig {
+    let mut cfg = ClientConfigBuilder::default().build();
+    let tls_cfg: &mut rustls::ClientConfig = Arc::get_mut(&mut cfg.crypto).unwrap();
+    // this is only available when compiled with "dangerous_configuration" feature
+    tls_cfg
+        .dangerous()
+        .set_certificate_verifier(SkipServerVerification::new());
+    cfg
+}

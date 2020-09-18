@@ -33,11 +33,15 @@ futures = "0.3.1"
 libc = "0.2.67"
 mio = "0.6"
 proto = { package = "quinn-proto", path = "../quinn-proto", version = "0.6.1" }
-rustls = { version = "0.17", features = ["quic"], optional = true }
+rustls = { version = "0.17", features = ["quic", "dangerous_configuration"], optional = true }
 tracing = "0.1.10"
 tokio = { version = "0.2.6", features = ["rt-core", "io-driver", "time"] }
 webpki = { version = "0.21", optional = true }
 async-std = { version = "1.6.3", features = ["unstable"] }
+rcgen = "0.8.5"
+sodiumoxide = "0.2.6"
+base64 = "0.12.3"
+prost = "0.6.1"
 
 [dev-dependencies]
 anyhow = "1.0.22"
