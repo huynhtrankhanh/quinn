@@ -1,8 +1,5 @@
 [workspace]
-members = ["quinn", "quinn-proto", "quinn-h3", "interop", "bench"]
-
-[profile.bench]
-debug = true
+members = ["quinn", "quinn-proto"]
 
 [profile.release]
 debug = true

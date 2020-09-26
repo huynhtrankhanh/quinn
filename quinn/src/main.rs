@@ -48,7 +48,6 @@ let (endpoint, _) = builder.bind(&\"[::]:0\".parse().unwrap()).unwrap();
 //! authority. If this is infeasible--for example, if servers are short-lived or not associated
 //! with a domain name--then as with TLS, self-signed certificates can be used to provide
 //! encryption alone.
-#![warn(missing_docs)]
 
 mod broadcast;
 mod builders;
@@ -161,13 +160,22 @@ use futures::StreamExt;
 use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use crate::{ClientConfig, ClientConfigBuilder, Endpoint};
+use async_std::prelude::*;
+
+use std::collections::HashMap;
+
+use sodiumoxide::crypto::{box_, sign};
 
 fn main() {
     task::block_on(async move {
         use async_std::io::{self, BufReader};
         let mut incoming_data = BufReader::new(io::stdin());
+
+        let mut connections = HashMap::<SocketAddr, crate::Connection>::new();
+
         loop {
             let mut line = String::new();
+
             incoming_data.read_line(&mut line).await.unwrap();
 
             let blob = base64::decode(line).unwrap();
@@ -194,6 +202,49 @@ fn main() {
                 // to be zero. The incoming packet is discarded.
                 continue;
             }
+
+            let message_type = match advance(1) {
+                Some(it) => it[0],
+                None => continue,
+            };
+
+            enum MessageType {
+                Advertisement,
+                Packet,
+            };
+
+            use MessageType::*;
+
+            let message_type = match message_type {
+                0 => Advertisement,
+                1 => Packet,
+                _ => continue,
+            };
+
+            match message_type {
+                Advertisement => {
+                    let public_encryption_key = advance(box_::PUBLICKEYBYTES);
+                    let public_signing_key = advance(sign::PUBLICKEYBYTES);
+
+                    if let Some(_) = advance(1) {
+                        // Discard the packet as it contains additional garbage.
+                        continue;
+                    }
+
+                    let public_encryption_key = match public_encryption_key {
+                        Some(it) => box_::PublicKey::from_slice(it),
+                        None => continue,
+                    };
+
+                    let public_signing_key = match public_signing_key {
+                        Some(it) => sign::PublicKey::from_slice(it),
+                        None => continue,
+                    };
+
+                    // Check hash table: if connection doesn't exist, create one                    
+                }
+                Packet => {}
+            };
         }
     });
 }
@@ -251,7 +302,7 @@ async fn run_client(
         Sender<Transmit>,
         Receiver<(Vec<u8>, SocketAddr, Option<EcnCodepoint>)>,
     ),
-) -> Result<(), Box<dyn Error>> {
+) -> crate::Connection {
     let client_cfg = configure_client();
     let mut endpoint_builder = Endpoint::builder();
     endpoint_builder.default_client_config(client_cfg);
@@ -265,12 +316,8 @@ async fn run_client(
         .await
         .unwrap();
     println!("[client] connected: addr={}", connection.remote_address());
-    // Dropping handles allows the corresponding objects to automatically shut down
-    drop(connection);
-    // Make sure the server has a chance to clean up
-    endpoint.wait_idle().await;
-
-    Ok(())
+    
+    connection
 }
 
 /// Dummy certificate verifier that treats any certificate as valid.
