@@ -343,7 +343,7 @@ async fn main() {
 
         incoming_data.read_line(&mut line).await.unwrap();
 
-        let blob = base64::decode(line).unwrap();
+        let blob = base64::decode(line.trim()).unwrap();
 
         let mut counter: usize = 0;
 
