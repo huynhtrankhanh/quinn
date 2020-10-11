@@ -345,7 +345,7 @@ async fn main() {
 
         let blob = match base64::decode(line.trim()) {
             Ok(it) => it,
-            Err(_) => continue;
+            Err(_) => continue,
         };
 
         let mut counter: usize = 0;
